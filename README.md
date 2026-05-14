@@ -7,19 +7,21 @@ Proof-of-concept REST service that exposes **Nova VM lifecycle** operations behi
 ## Table of contents
 
 1. [What this application does](#what-this-application-does)
-2. [How mode is selected (configuration)](#how-mode-is-selected-configuration)
-3. [Request flow (end-to-end)](#request-flow-end-to-end)
-4. [Mock mode — behavior and logic](#mock-mode--behavior-and-logic)
-5. [Real mode — behavior and logic](#real-mode--behavior-and-logic)
-6. [HTTP API and error mapping](#http-api-and-error-mapping)
-7. [Quick start](#quick-start)
-8. [Docker](#docker)
-9. [Testing](#testing)
-10. [OpenStack credentials for real mode](#openstack-credentials-for-real-mode)
-11. [Architecture summary](#architecture-summary)
-12. [SDLC](#sdlc)
-13. [Roadmap / backlog](#roadmap--backlog)
-14. [License](#license)
+2. [Documentation (where to read what)](#documentation-where-to-read-what)
+3. [Design choices (rationale and trade-offs)](#design-choices-rationale-and-trade-offs)
+4. [How mode is selected (configuration)](#how-mode-is-selected-configuration)
+5. [Request flow (end-to-end)](#request-flow-end-to-end)
+6. [Mock mode — behavior and logic](#mock-mode--behavior-and-logic)
+7. [Real mode — behavior and logic](#real-mode--behavior-and-logic)
+8. [HTTP API and error mapping](#http-api-and-error-mapping)
+9. [Quick start](#quick-start)
+10. [Docker](#docker)
+11. [Testing](#testing)
+12. [OpenStack credentials for real mode](#openstack-credentials-for-real-mode)
+13. [Architecture summary](#architecture-summary)
+14. [SDLC](#sdlc)
+15. [Roadmap / backlog](#roadmap--backlog)
+16. [License](#license)
 
 ---
 
@@ -40,6 +42,71 @@ All VM operations go through a single Python interface, **`VMService`** (`app/se
 | **`OpenStackVMService`**  | `app/services/openstack_vm.py` | `OPENSTACK_MODE=real`            |
 
 FastAPI routes in `app/api/routes/vms.py` only talk to `VMService`; they do not branch on mock vs real. That keeps the HTTP contract identical in both modes.
+
+---
+
+## Documentation (where to read what)
+
+| Audience / goal | What to use |
+|-----------------|-------------|
+| **Human overview, modes, logic, design** | This **README** (single source for assessment-style documentation). |
+| **Exact HTTP contract (schemas, try-it-out)** | **OpenAPI UI** at [`/docs`](http://127.0.0.1:8000/docs) (Swagger) and **ReDoc** at [`/redoc`](http://127.0.0.1:8000/redoc) while the server is running. |
+| **Machine-readable spec** | **`GET /openapi.json`** (standard FastAPI) for codegen, mocks, or contract tests. |
+| **Environment template** | **`.env.example`** — lists `OPENSTACK_MODE`, optional `OPENSTACK_PROJECT_ID`, and commented **`OS_*`** placeholders for real mode (copy to `.env`; `.env` is gitignored). |
+| **CI behavior** | **`.github/workflows/ci.yml`** — documents the minimal quality gate (`pytest`). |
+| **Container entrypoint and OS packages** | **`Dockerfile`**, **`docker-compose.yml`**. |
+| **Code map** | `app/main.py` (app factory), `app/api/routes/` (HTTP), `app/services/` (mock + OpenStack), `app/models/schemas.py` (Pydantic types), `app/config.py`, `app/deps.py`, `tests/`. |
+
+**Why OpenAPI is first-class:** Pydantic models on routes double as validation and documentation. Any field or status code change should be reflected automatically in `/docs`, reducing drift between “docs” and “code.”
+
+---
+
+## Design choices (rationale and trade-offs)
+
+### API shape and versioning
+
+- **Prefix `/api/v1`:** Leaves room for breaking or parallel evolution (`v2`) without collision with future root routes (metrics, admin).
+- **Resource + sub-resource actions (`POST .../actions/start`):** Chosen over a generic `PATCH` with a `state` field because actions are **explicit**, easy to audit, and align with common cloud patterns (and Nova’s action-oriented model). **Trade-off:** more endpoints than a minimal CRUD surface.
+
+### Backend abstraction (`VMService`)
+
+- **Strategy pattern** (interface + mock + real): One HTTP layer, two behaviors. **Benefit:** identical integration tests and demos in mock mode; assessors can run the repo without a cloud. **Cost:** the mock must stay behaviorally close enough to real mode for tests to be meaningful (we document differences explicitly in this README).
+
+### Configuration (`pydantic-settings`, `lru_cache`)
+
+- **12-factor style env + optional `.env`:** Fits containers and Kubernetes without inventing a custom config format.
+- **`get_settings` cached:** Avoids re-parsing env on every call; **implication:** changing env at runtime without restart does not refresh settings (acceptable for this PoC).
+
+### Mock singleton vs new OpenStack service per request
+
+- **Mock singleton:** Preserves VM state across requests in one process (expected for an in-memory “cloud”).
+- **New `OpenStackVMService` per HTTP request:** Keeps dependency wiring simple and avoids holding SDK state across unrelated clients in a PoC. **Trade-off:** no connection pooling across requests; a production service would typically inject a **shared connection pool** or **per-tenant session** factory.
+
+### Async + `asyncio.to_thread` for OpenStack
+
+- **Problem:** `openstacksdk` is synchronous; calling it directly inside `async def` would block the event loop.
+- **Choice:** `asyncio.to_thread` for each service method body. **Alternative:** run FastAPI in a sync stack (not ideal) or adopt an async-native client (not officially the path for openstacksdk). **Trade-off:** thread overhead and GIL interaction; acceptable for moderate concurrency in a PoC.
+
+### Create VM: `wait_for_server` in real mode
+
+- **Choice:** Block until Nova reports a terminal-ish state for the new server. **Benefit:** simple client semantics (`POST` returns the final or near-final VM). **Trade-off:** long HTTP requests, proxy timeouts, and poor UX at scale — listed in [Roadmap](#roadmap--backlog) (async jobs + `202`).
+
+### Errors: `VMNotFoundError`, `404`, `502`
+
+- **`VMNotFoundError`** for missing VMs on **actions** gives a clear domain signal without importing HTTP into the service layer.
+- **Broad `502` mapping** on unexpected errors in routes keeps the PoC small; **trade-off:** clients cannot distinguish auth errors, quota, and network failures without parsing `detail` strings — production would use structured problem details and typed exceptions.
+
+### Status normalization (`VMStatus`)
+
+- **Why:** Nova exposes many string statuses; API consumers want a smaller enum. **Trade-off:** “shelved” and “shutoff” both map to `STOPPED`; clients that need fine granularity should call Nova directly or extend the mapper.
+
+### Security (explicit non-goals for this PoC)
+
+- **No authn/authz** on the API itself: acceptable for a closed lab or local demo; **not** acceptable on a public network. Roadmap calls out OAuth2/JWT or mTLS.
+
+### Testing strategy
+
+- **`pytest` + `TestClient` + dependency override:** Tests the real HTTP stack and route wiring without binding to a cloud. **`OPENSTACK_MODE=mock`** in tests plus an isolated `MockVMService` avoids the global singleton leaking state between tests.
 
 ---
 
@@ -308,12 +375,7 @@ flowchart TB
   M --> Mem[(In-memory dict)]
 ```
 
-Design highlights:
-
-- **Single interface** (`VMService`) for all backends.
-- **Pydantic v2** for request/response validation and OpenAPI.
-- **Thread offload** in real mode to avoid blocking the asyncio loop.
-- **Domain exception** `VMNotFoundError` for missing VMs on lifecycle actions; routes map it to **404**.
+The diagram matches the sections above: **routes → DI → implementation → backend**. For a deeper rationale for each box, see [Design choices](#design-choices-rationale-and-trade-offs).
 
 ---
 
@@ -342,4 +404,3 @@ Design highlights:
 ## License
 
 MIT — see [LICENSE](LICENSE).
-# OpenStack-VM-API
